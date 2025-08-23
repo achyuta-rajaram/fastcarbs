@@ -1,0 +1,21 @@
+[build-system]
+requires = ["scikit-build-core>=0.9.0", "pybind11>=3.0", "numpy", "packaging"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "FastCARBS"
+version = "0.1.0"
+description = "Fast drop-in GP backend for CARBS (C++/pybind11)"
+readme = "README.md"
+authors = [{ name = "soham govande" }]
+dependencies = ["numpy", "scikit-learn", "torch", "loguru", "carbs"]
+
+[tool.scikit-build]
+wheel.expand-macos-universal-tags = true
+wheel.packages = ["fastcarbs"]
+
+[tool.scikit-build.cmake]
+args = []
+
+[tool.uv.sources]
+carbs = { path = "carbs-base" }
