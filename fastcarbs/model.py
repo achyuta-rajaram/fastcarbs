@@ -42,7 +42,7 @@ class _CppGP:
         self._y_cache = y.detach().cpu().double().clone()
         self._gp.set_data(self._X_cache.numpy(), self._y_cache.numpy())
 
-    def fit(self, num_steps: int = 2000, lr: float = 1e-2) -> None:
+    def fit(self, num_steps: int = 1000, lr: float = 1e-4) -> None:
         self._gp.fit(num_steps, lr)
         self._fitted = True
 
@@ -92,12 +92,12 @@ class SurrogateModel:
             kernel = self._make_main_kernel()
         gp = _CppGP(kernel, noise_var=1e-2, jitter=1e-4)
         gp.set_data(X.double(), y.double())
-        gp.fit(num_steps=2000, lr=1e-2)
+        gp.fit()
         return gp
 
     def _fit_target_transformers(self, success_observations: List[ObservationInBasic]) -> None:
         raw_outputs = np.array([x.output for x in success_observations], dtype=np.float64)
-        n_quantiles = max(10, int(np.sqrt(len(success_observations))))
+        n_quantiles = int(np.sqrt(len(success_observations)))
         self.output_transformer = QuantileTransformer(
             output_distribution="normal", n_quantiles=n_quantiles
         )
@@ -111,7 +111,7 @@ class SurrogateModel:
 
     def _target_to_surrogate(self, x: TorchTensor) -> TorchTensor:
         assert self.output_transformer is not None
-        x_np = x.detach().cpu().double().view(-1, 1).numpy()
+        x_np = x.cpu().double().view(-1, 1).numpy()
         tx = self.output_transformer.transform(x_np) * self.params.better_direction_sign
         return torch.from_numpy(tx).to(torch.float64).view(*x.shape)
 
@@ -190,7 +190,7 @@ class SurrogateModel:
         outs = self._target_to_surrogate(
             torch.tensor([x.output for x in pareto_observations], dtype=torch.float64)
         )
-        gp = _CppGP(self._make_pareto_kernel(), noise_var=1e-2, jitter=1e-6)
+        gp = _CppGP(self._make_pareto_kernel(), noise_var=1e-2, jitter=1e-4)
         gp.set_data(logc, outs)
         gp.fit(num_steps=1000, lr=1e-2)  # 1D => fewer steps suffice
         self.pareto_model = gp
@@ -228,7 +228,7 @@ class SurrogateModel:
         if self.success_model is None:
             return torch.ones((X.shape[0],), dtype=torch.float64)
         mu, var = self.success_model.predict(X.to(torch.float64), noiseless=True)
-        prior = Normal(mu, torch.sqrt(torch.clamp(var, min=1e-12)))
+        prior = Normal(mu, var)
         return prior.cdf(torch.zeros_like(mu, dtype=torch.float64))
 
     @torch.no_grad()

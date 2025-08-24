@@ -3,6 +3,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+
 #include <Eigen/Dense>
 #include <cmath>
 #include <vector>
@@ -13,7 +14,6 @@ namespace py = pybind11;
 using Eigen::MatrixXd;
 using Eigen::VectorXd;
 
-// --------- Small helpers ----------
 static inline double softplus(double x) { // unused, we parameterize with exp()
     if (x > 20.0) return x; // avoid overflow
     if (x < -20.0) return std::exp(x);
@@ -24,7 +24,7 @@ struct Adam {
     double lr, b1, b2, eps;
     std::vector<double> m, v;
     int t = 0;
-    Adam(size_t n, double lr_=1e-2, double b1_=0.9, double b2_=0.999, double eps_=1e-8)
+    Adam(size_t n, double lr_=1e-4, double b1_=0.9, double b2_=0.999, double eps_=1e-8)
         : lr(lr_), b1(b1_), b2(b2_), eps(eps_), m(n, 0.0), v(n, 0.0) {}
     void step(std::vector<double>& params, const std::vector<double>& grad) {
         t++;
@@ -39,7 +39,6 @@ struct Adam {
     }
 };
 
-// ---------- Kernels ----------
 struct Kernel {
     virtual ~Kernel() = default;
     virtual void K(const MatrixXd& X, MatrixXd& Kout) const = 0;
@@ -94,7 +93,7 @@ struct Matern32ARD : public Kernel {
         std::vector<double> invls2;
         inv_ls_sq(invls2);
         for (int i=0;i<n;++i) {
-            Kout(i,i) = sig2(); // when r=0, (1+0)*exp(0)=1
+            Kout(i,i) = sig2();
             for (int j=i+1;j<n;++j) {
                 double s = 0.0;
                 for (int k=0;k<(int)D();++k) {
@@ -129,21 +128,16 @@ struct Matern32ARD : public Kernel {
         }
     }
 
-    // Gradient w.r.t. parameters via trace( A dK/dθ ), A = αα^T - K^{-1}
     void grad_params(const MatrixXd& X, const MatrixXd& A, std::vector<double>& g) const override {
         const int n = X.rows();
         g.assign(1 + D(), 0.0);
-
-        // precompute pairwise components
         std::vector<double> invls2;
         inv_ls_sq(invls2);
         const double sig2v = sig2();
 
-        // grad wrt log_sig2: dK/dsig2 = (1 + a r) e^{-a r}
         double g_sig2 = 0.0;
         for (int i=0;i<n;++i) {
-            // diagonal r==0 -> (1)*1
-            g_sig2 += A(i,i) * 1.0;
+            g_sig2 += 0.5 * A(i,i);
             for (int j=i+1;j<n;++j) {
                 double s = 0.0;
                 for (size_t k=0;k<D();++k) {
@@ -152,16 +146,12 @@ struct Matern32ARD : public Kernel {
                 }
                 double r = std::sqrt(std::max(0.0, s));
                 double term = (1.0 + a*r)*std::exp(-a*r);
-                double contrib = (A(i,j)+A(j,i)) * term * 0.5; // A is symmetric; be safe
+                double contrib = (A(i,j)+A(j,i)) * term * 0.5;
                 g_sig2 += contrib;
             }
         }
-        // chain rule: d/d log_sig2 = d/d sig2 * sig2
         g[0] = g_sig2 * sig2v;
 
-        // grad wrt log lengthscales:
-        // ∂k/∂ℓ_i = σ^2 * a^2 * exp(-a r) * ( (x_i - z_i)^2 / ℓ_i^3 )
-        // then d/d logℓ_i = ∂k/∂ℓ_i * ℓ_i
         for (size_t dim=0; dim<D(); ++dim) {
             double li = std::exp(log_ls[dim]);
             double invli = 1.0/li;
@@ -169,7 +159,6 @@ struct Matern32ARD : public Kernel {
             double accum = 0.0;
             for (int i=0;i<n;++i) {
                 for (int j=i+1;j<n;++j) {
-                    // compute r
                     double s = 0.0;
                     for (size_t k=0;k<D();++k) {
                         double d = X(i,k)-X(j,k);
@@ -184,7 +173,6 @@ struct Matern32ARD : public Kernel {
                     accum += contrib;
                 }
             }
-            // chain: d/d logℓ_i = ∂/∂ℓ_i * ℓ_i
             g[1+dim] = accum * li;
         }
     }
@@ -203,7 +191,7 @@ struct Matern32ARD : public Kernel {
     }
 };
 
-// Linear kernel: k = sig2 * (x dot z)
+// Linear kernel
 struct LinearKernel : public Kernel {
     double log_sig2;
     size_t d;
@@ -212,16 +200,8 @@ struct LinearKernel : public Kernel {
     inline double sig2() const { return std::exp(log_sig2); }
 
     double k(const Eigen::Ref<const VectorXd>& xa,
-             const Eigen::Ref<const VectorXd>& xb) const override {
-        return sig2() * xa.dot(xb);
-    }
-
-    void K(const MatrixXd& X, MatrixXd& Kout) const override {
-        // K = sig2 * X X^T
-        MatrixXd XXt = X * X.transpose();
-        Kout = sig2() * XXt;
-    }
-
+             const Eigen::Ref<const VectorXd>& xb) const override { return sig2() * xa.dot(xb); }
+    void K(const MatrixXd& X, MatrixXd& Kout) const override { Kout = sig2() * (X * X.transpose()); }
     void K_cross(const MatrixXd& Xa, const MatrixXd& Xb, MatrixXd& Kout) const override {
         Kout = sig2() * (Xa * Xb.transpose());
     }
@@ -230,7 +210,7 @@ struct LinearKernel : public Kernel {
         // dK/dsig2 = X X^T  -> gradient = 0.5 trace(A * dK/dsig2) * chain(log)
         MatrixXd XXt = X * X.transpose();
         double tr = (A.cwiseProduct(XXt)).sum();
-        g.assign(1, tr * sig2()); // d/d log_sig2 = d/d sig2 * sig2
+        g.assign(1, 0.5 * tr * sig2());
     }
 
     size_t num_params() const override { return 1; }
@@ -241,7 +221,7 @@ struct LinearKernel : public Kernel {
     void get_params(std::vector<double>& p) const override { p = {log_sig2}; }
 };
 
-// Sum kernel: K = K1 + K2
+// Sum kernel
 struct SumKernel : public Kernel {
     std::unique_ptr<Kernel> k1, k2;
     SumKernel(std::unique_ptr<Kernel> a, std::unique_ptr<Kernel> b)
@@ -251,46 +231,28 @@ struct SumKernel : public Kernel {
         return k1->k(xa, xb) + k2->k(xa, xb);
     }
     void K(const MatrixXd& X, MatrixXd& Kout) const override {
-        MatrixXd A, B;
-        k1->K(X, A);
-        k2->K(X, B);
-        Kout = A + B;
+        MatrixXd A, B; k1->K(X, A); k2->K(X, B); Kout = A + B;
     }
     void K_cross(const MatrixXd& Xa, const MatrixXd& Xb, MatrixXd& Kout) const override {
-        MatrixXd A, B;
-        k1->K_cross(Xa, Xb, A);
-        k2->K_cross(Xa, Xb, B);
-        Kout = A + B;
+        MatrixXd A, B; k1->K_cross(Xa, Xb, A); k2->K_cross(Xa, Xb, B); Kout = A + B;
     }
     void grad_params(const MatrixXd& X, const MatrixXd& A, std::vector<double>& g) const override {
-        std::vector<double> g1, g2;
-        k1->grad_params(X, A, g1);
-        k2->grad_params(X, A, g2);
-        g.clear();
-        g.reserve(g1.size()+g2.size());
-        g.insert(g.end(), g1.begin(), g1.end());
-        g.insert(g.end(), g2.begin(), g2.end());
+        std::vector<double> g1, g2; k1->grad_params(X, A, g1); k2->grad_params(X, A, g2);
+        g.clear(); g.reserve(g1.size()+g2.size()); g.insert(g.end(), g1.begin(), g1.end()); g.insert(g.end(), g2.begin(), g2.end());
     }
     size_t num_params() const override { return k1->num_params() + k2->num_params(); }
     void set_params(const std::vector<double>& p) override {
         size_t n1 = k1->num_params();
-        std::vector<double> p1(p.begin(), p.begin()+n1);
-        std::vector<double> p2(p.begin()+n1, p.end());
-        k1->set_params(p1);
-        k2->set_params(p2);
+        std::vector<double> p1(p.begin(), p.begin()+n1), p2(p.begin()+n1, p.end());
+        k1->set_params(p1); k2->set_params(p2);
     }
     void get_params(std::vector<double>& p) const override {
-        std::vector<double> p1, p2;
-        k1->get_params(p1);
-        k2->get_params(p2);
-        p.clear();
-        p.reserve(p1.size()+p2.size());
-        p.insert(p.end(), p1.begin(), p1.end());
-        p.insert(p.end(), p2.begin(), p2.end());
+        std::vector<double> p1, p2; k1->get_params(p1); k2->get_params(p2);
+        p.clear(); p.reserve(p1.size()+p2.size()); p.insert(p.end(), p1.begin(), p1.end()); p.insert(p.end(), p2.begin(), p2.end());
     }
 };
 
-// RBF (for 1D Pareto fit): k = sig2 * exp(-0.5 (x-z)^2 / l^2)
+// RBF (1D) kernel
 struct RBF1D : public Kernel {
     double log_sig2;
     double log_l;
@@ -332,7 +294,7 @@ struct RBF1D : public Kernel {
         double sig2v = sig2(), lv = l();
         double invl2 = 1.0/(lv*lv);
         for (int i=0;i<n;++i) {
-            g_sig2 += A(i,i) * 1.0;
+            g_sig2 += 0.5 * A(i,i);  // add the 0.5
             for (int j=i+1;j<n;++j) {
                 double d = X(i,0)-X(j,0);
                 double q = (d*d)*invl2;
@@ -353,7 +315,6 @@ struct RBF1D : public Kernel {
     void get_params(std::vector<double>& p) const override { p = {log_sig2, log_l}; }
 };
 
-// ---------- GP Regression ----------
 class GPRegression {
 public:
     std::unique_ptr<Kernel> kernel;
@@ -531,26 +492,33 @@ public:
     }
 };
 
-// -------- pybind11 module --------
 PYBIND11_MODULE(fastcarbs_core, m) {
-    py::classh<GPRegression>(m, "GPRegression")
+    py::class_<GPRegression, py::smart_holder>(m, "GPRegression")
         .def(py::init<std::unique_ptr<Kernel>, double, double>(),
              py::arg("kernel"), py::arg("noise_var")=1e-2, py::arg("jitter")=1e-4)
         .def("set_data", &GPRegression::set_data)
-        .def("fit", &GPRegression::fit, py::arg("num_steps")=2000, py::arg("lr")=1e-2)
+        .def("fit", &GPRegression::fit, py::arg("num_steps")=1000, py::arg("lr")=1e-4)
         .def("predict", &GPRegression::predict, py::arg("Xq"), py::arg("noiseless")=true)
         .def("sample_marginals", &GPRegression::sample_marginals,
              py::arg("Xq"), py::arg("noiseless")=true, py::arg("seed")=0)
         .def("get_hypers", &GPRegression::get_hypers);
 
-    py::classh<Kernel>(m, "Kernel");
-    py::classh<Matern32ARD, Kernel>(m, "Matern32ARD")
-        .def(py::init<size_t,double,double>(), py::arg("input_dim"), py::arg("init_lengthscale"),
+    py::class_<Kernel, py::smart_holder>(m, "Kernel");
+
+    py::class_<Matern32ARD, Kernel, py::smart_holder>(m, "Matern32ARD")
+        .def(py::init<size_t,double,double>(),
+             py::arg("input_dim"), py::arg("init_lengthscale"),
              py::arg("init_variance")=1.0);
-    py::classh<LinearKernel, Kernel>(m, "LinearKernel")
-        .def(py::init<size_t,double>(), py::arg("input_dim"), py::arg("init_variance")=1.0);
-    py::classh<SumKernel, Kernel>(m, "SumKernel")
-        .def(py::init<std::unique_ptr<Kernel>, std::unique_ptr<Kernel>>());
-    py::classh<RBF1D, Kernel>(m, "RBF1D")
-        .def(py::init<double,double>(), py::arg("init_lengthscale")=1.0, py::arg("init_variance")=1.0);
+
+    py::class_<LinearKernel, Kernel, py::smart_holder>(m, "LinearKernel")
+        .def(py::init<size_t,double>(),
+             py::arg("input_dim"), py::arg("init_variance")=1.0);
+
+    py::class_<SumKernel, Kernel, py::smart_holder>(m, "SumKernel")
+        .def(py::init<std::unique_ptr<Kernel>, std::unique_ptr<Kernel>>(),
+             py::arg("k1"), py::arg("k2"));
+
+    py::class_<RBF1D, Kernel, py::smart_holder>(m, "RBF1D")
+        .def(py::init<double,double>(),
+             py::arg("init_lengthscale")=1.0, py::arg("init_variance")=1.0);
 }
