@@ -1,0 +1,3 @@
+[submodule "carbs-base"]
+	path = carbs-base
+	url = https://github.com/imbue-ai/carbs
