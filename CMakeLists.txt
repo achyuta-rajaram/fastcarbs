@@ -20,4 +20,4 @@ set_target_properties(fastcarbs_core PROPERTIES SKBUILD_MODULE_NAME fastcarbs.fa
 
 # Ensure the extension target is installed for both normal and editable installs
 install(TARGETS fastcarbs_core LIBRARY DESTINATION .)
-target_compile_options(fastcarbs_core PRIVATE -fno-fast-math)
+target_compile_options(fastcarbs_core PRIVATE -O3 -ffast-math -march=native)
