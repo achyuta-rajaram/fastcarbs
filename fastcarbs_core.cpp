@@ -418,7 +418,7 @@ public:
         log_noise = params.back();
         // Cache final K, chol, alpha
         std::vector<double> g;
-        (void) nlml_and_grad(g);
+        nlml_and_grad(g);
     }
 
     // Predict: returns mean and variance (diagonal), noiseless flag removes noise from variance
