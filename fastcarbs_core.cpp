@@ -6,495 +6,576 @@
 
 #include <Eigen/Dense>
 #include <cmath>
-#include <vector>
+#include <memory>
 #include <random>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace py = pybind11;
-using Eigen::MatrixXd;
-using Eigen::VectorXd;
 
-static inline double softplus(double x) { // unused, we parameterize with exp()
-    if (x > 20.0) return x; // avoid overflow
-    if (x < -20.0) return std::exp(x);
-    return std::log1p(std::exp(x));
+// ------------------------------- Utilities -------------------------------
+
+inline Eigen::MatrixXd as_eigen_2d(py::array_t<double, py::array::c_style | py::array::forcecast> a) {
+    if (a.ndim() != 2) throw std::invalid_argument("Expected a 2D array.");
+    auto buf = a.request();
+    auto* ptr = static_cast<double*>(buf.ptr);
+    // Row-major map then copy into Eigen's default column-major MatrixXd
+    Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> M(ptr, buf.shape[0], buf.shape[1]);
+    return Eigen::MatrixXd(M);
 }
 
-struct Adam {
-    double lr, b1, b2, eps;
-    std::vector<double> m, v;
-    int t = 0;
-    Adam(size_t n, double lr_=1e-4, double b1_=0.9, double b2_=0.999, double eps_=1e-8)
-        : lr(lr_), b1(b1_), b2(b2_), eps(eps_), m(n, 0.0), v(n, 0.0) {}
-    void step(std::vector<double>& params, const std::vector<double>& grad) {
-        t++;
-        double b1t = std::pow(b1, t);
-        double b2t = std::pow(b2, t);
-        double alpha = lr * std::sqrt(1.0 - b2t) / (1.0 - b1t);
-        for (size_t i = 0; i < params.size(); ++i) {
-            m[i] = b1*m[i] + (1.0 - b1)*grad[i];
-            v[i] = b2*v[i] + (1.0 - b2)*grad[i]*grad[i];
-            params[i] -= alpha * m[i] / (std::sqrt(v[i]) + eps);
+inline Eigen::VectorXd as_eigen_vec(py::array_t<double, py::array::c_style | py::array::forcecast> a) {
+    if (a.ndim() == 1) {
+        auto buf = a.request();
+        auto* ptr = static_cast<double*>(buf.ptr);
+        Eigen::Map<const Eigen::VectorXd> v(ptr, buf.shape[0]);
+        return Eigen::VectorXd(v);
+    } else if (a.ndim() == 2) {
+        auto buf = a.request();
+        auto* ptr = static_cast<double*>(buf.ptr);
+        if (buf.shape[1] == 1) {
+            // (N,1) -> VectorXd
+            Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, 1>> v(ptr, buf.shape[0]);
+            return Eigen::VectorXd(v);
+        } else if (buf.shape[0] == 1) {
+            // (1,N) -> RowVectorXd, then transpose
+            Eigen::Map<const Eigen::RowVectorXd> v(ptr, buf.shape[1]);
+            return Eigen::VectorXd(v.transpose());
+        } else {
+            throw std::invalid_argument("y must be shape (N,), (N,1), or (1,N).");
         }
+    } else {
+        throw std::invalid_argument("y must be 1D or 2D.");
     }
-};
+}
 
-struct Kernel {
+inline py::array_t<double> eigen_to_numpy(const Eigen::VectorXd& v) {
+    py::array_t<double> out(v.size());
+    auto buf = out.request();
+    double* ptr = static_cast<double*>(buf.ptr);
+    Eigen::Map<Eigen::VectorXd>(ptr, v.size()) = v;
+    return out;
+}
+
+// ------------------------------- Kernel Base -------------------------------
+
+class Kernel {
+public:
     virtual ~Kernel() = default;
-    virtual void K(const MatrixXd& X, MatrixXd& Kout) const = 0;
-    virtual void K_cross(const MatrixXd& Xa, const MatrixXd& Xb, MatrixXd& Kout) const = 0;
-    virtual double k(const Eigen::Ref<const Eigen::VectorXd>& xa,
-                     const Eigen::Ref<const Eigen::VectorXd>& xb) const = 0;
-    virtual void grad_params(const MatrixXd& X, const MatrixXd& A, std::vector<double>& g) const = 0;
+    virtual std::string name() const = 0;
+    virtual size_t input_dim() const = 0;
+
+    // K(X, Z) : N x M
+    virtual Eigen::MatrixXd K(const Eigen::MatrixXd& X, const Eigen::MatrixXd& Z) const = 0;
+
+    // K(X, X) : N x N
+    virtual Eigen::MatrixXd K(const Eigen::MatrixXd& X) const {
+        return K(X, X);
+    }
+
+    // Diagonal of K(X, X)
+    virtual Eigen::VectorXd Kdiag(const Eigen::MatrixXd& X) const {
+        Eigen::MatrixXd Kxx = K(X, X);
+        return Kxx.diagonal();
+    }
+
+    // Parameterization: all positive hypers are internally stored as logs.
     virtual size_t num_params() const = 0;
-    virtual void set_params(const std::vector<double>& p) = 0;  // unconstrained
-    virtual void get_params(std::vector<double>& p) const = 0;  // unconstrained
+    virtual void get_unconstrained(Eigen::VectorXd& u, size_t& off) const = 0;
+    virtual void set_unconstrained(const Eigen::VectorXd& u, size_t& off) = 0;
+    virtual void add_grad_wrt_unconstrained(const Eigen::MatrixXd& X,
+                                            const Eigen::MatrixXd& B,
+                                            Eigen::VectorXd& grad,
+                                            size_t& off) const = 0;
+
+    virtual py::dict hypers_dict() const = 0;
 };
 
-// Matern-3/2 with ARD: k = sig2 * (1 + a r) exp(-a r), r = sqrt(sum_j (d_j^2 / l_j^2)), a = sqrt(3)
-struct Matern32ARD : public Kernel {
-    // unconstrained parameters are logs: log(sig2), log(l_j) for each dim
-    double log_sig2;                  // amplitude variance
-    std::vector<double> log_ls;       // ARD lengthscales
-    const double a = std::sqrt(3.0);
+// ------------------------------- Matern32 ARD -------------------------------
+// k(x,z) = sigma2 * (1 + sqrt(3) r) * exp(-sqrt(3) r)
+// where r = sqrt( sum_j ((x_j - z_j)^2 / ell_j^2) )
+class Matern32ARD final : public Kernel {
+public:
+    Matern32ARD(size_t input_dim, double init_lengthscale, double init_variance = 1.0)
+        : D_(input_dim), log_ell_(Eigen::VectorXd::Constant(input_dim, std::log(init_lengthscale))),
+          log_sigma2_(std::log(init_variance)) {}
 
-    explicit Matern32ARD(size_t d, double init_ls, double init_sig2=1.0)
-      : log_sig2(std::log(init_sig2)), log_ls(d, std::log(init_ls)) {}
+    std::string name() const override { return "Matern32ARD"; }
+    size_t input_dim() const override { return D_; }
 
-    size_t D() const { return log_ls.size(); }
-
-    inline double sig2() const { return std::exp(log_sig2); }
-
-    inline void inv_ls_sq(std::vector<double>& invls2) const {
-        invls2.resize(D());
-        for (size_t i=0;i<D();++i) {
-            double li = std::exp(log_ls[i]);
-            invls2[i] = 1.0/(li*li);
+    Eigen::MatrixXd K(const Eigen::MatrixXd& X, const Eigen::MatrixXd& Z) const override {
+        if (static_cast<size_t>(X.cols()) != D_ || static_cast<size_t>(Z.cols()) != D_) {
+            throw std::invalid_argument("Matern32ARD: Input dimension mismatch.");
         }
-    }
+        const double sigma2 = std::exp(log_sigma2_);
+        const double a = std::sqrt(3.0);
 
-    double k(const Eigen::Ref<const VectorXd>& xa,
-             const Eigen::Ref<const VectorXd>& xb) const override {
-        std::vector<double> invls2;
-        inv_ls_sq(invls2);
-        double s = 0.0;
-        for (size_t j=0;j<D();++j) {
-            double d = xa[j]-xb[j];
-            s += d*d*invls2[j];
+        // Compute q = sum_j ( (x_j - z_j)^2 / ell_j^2 )
+        Eigen::MatrixXd q = Eigen::MatrixXd::Zero(X.rows(), Z.rows());
+        for (size_t j = 0; j < D_; ++j) {
+            const double inv_l2 = std::exp(-2.0 * log_ell_(j)); // 1 / ell^2
+            Eigen::VectorXd xj = X.col(static_cast<int>(j));
+            Eigen::VectorXd zj = Z.col(static_cast<int>(j));
+            Eigen::VectorXd xj2 = xj.array().square().matrix();
+            Eigen::VectorXd zj2 = zj.array().square().matrix();
+            Eigen::MatrixXd S = xj2.replicate(1, Z.rows())
+                              + zj2.transpose().replicate(X.rows(), 1)
+                              - 2.0 * (xj * zj.transpose());
+            q.noalias() += inv_l2 * S;
         }
-        double r = std::sqrt(std::max(0.0, s));
-        double term = (1.0 + a*r)*std::exp(-a*r);
-        return sig2() * term;
+        Eigen::MatrixXd r = q.array().max(0.0).sqrt().matrix();
+        Eigen::ArrayXXd E = (-a * r.array()).exp();       // exp(-a r)
+        Eigen::ArrayXXd base = (1.0 + a * r.array()) * E; // (1 + a r) exp(-a r)
+        Eigen::MatrixXd K = (sigma2 * base).matrix();
+        return K;
     }
 
-    void K(const MatrixXd& X, MatrixXd& Kout) const override {
-        const int n = X.rows();
-        Kout.resize(n, n);
-        std::vector<double> invls2;
-        inv_ls_sq(invls2);
-        for (int i=0;i<n;++i) {
-            Kout(i,i) = sig2();
-            for (int j=i+1;j<n;++j) {
-                double s = 0.0;
-                for (int k=0;k<(int)D();++k) {
-                    double d = X(i,k)-X(j,k);
-                    s += d*d*invls2[k];
-                }
-                double r = std::sqrt(std::max(0.0, s));
-                double term = (1.0 + a*r)*std::exp(-a*r);
-                double val = sig2()*term;
-                Kout(i,j)=val;
-                Kout(j,i)=val;
-            }
+    size_t num_params() const override { return D_ + 1; }
+
+    void get_unconstrained(Eigen::VectorXd& u, size_t& off) const override {
+        for (size_t j = 0; j < D_; ++j) u(off++) = log_ell_(static_cast<int>(j));
+        u(off++) = log_sigma2_;
+    }
+
+    void set_unconstrained(const Eigen::VectorXd& u, size_t& off) override {
+        for (size_t j = 0; j < D_; ++j) log_ell_(static_cast<int>(j)) = u(off++);
+        log_sigma2_ = u(off++);
+    }
+
+    void add_grad_wrt_unconstrained(const Eigen::MatrixXd& X,
+                                    const Eigen::MatrixXd& B,
+                                    Eigen::VectorXd& grad,
+                                    size_t& off) const override {
+        // Compute helpers on X
+        const int N = static_cast<int>(X.rows());
+        const double a = std::sqrt(3.0);
+        const double sigma2 = std::exp(log_sigma2_);
+
+        // Precompute per-dimension squared-distance matrices S_j and q = sum S_j / ell^2
+        std::vector<Eigen::MatrixXd> Sj(D_);
+        Eigen::MatrixXd q = Eigen::MatrixXd::Zero(N, N);
+        for (size_t j = 0; j < D_; ++j) {
+            Eigen::VectorXd xj = X.col(static_cast<int>(j));
+            Eigen::VectorXd xj2 = xj.array().square().matrix();
+            Eigen::MatrixXd S = xj2.replicate(1, N) + xj2.transpose().replicate(N, 1) - 2.0 * (xj * xj.transpose());
+            Sj[j] = std::move(S);
         }
-    }
-
-    void K_cross(const MatrixXd& Xa, const MatrixXd& Xb, MatrixXd& Kout) const override {
-        const int na = Xa.rows(), nb = Xb.rows();
-        Kout.resize(na, nb);
-        std::vector<double> invls2;
-        inv_ls_sq(invls2);
-        for (int i=0;i<na;++i) {
-            for (int j=0;j<nb;++j) {
-                double s = 0.0;
-                for (int k=0;k<(int)D();++k) {
-                    double d = Xa(i,k)-Xb(j,k);
-                    s += d*d*invls2[k];
-                }
-                double r = std::sqrt(std::max(0.0, s));
-                double term = (1.0 + a*r)*std::exp(-a*r);
-                Kout(i,j) = sig2()*term;
-            }
+        for (size_t j = 0; j < D_; ++j) {
+            const double inv_l2 = std::exp(-2.0 * log_ell_(static_cast<int>(j)));
+            q.noalias() += inv_l2 * Sj[j];
         }
-    }
+        Eigen::MatrixXd r = q.array().max(0.0).sqrt().matrix();
+        Eigen::ArrayXXd E = (-a * r.array()).exp();              // exp(-a r)
+        Eigen::ArrayXXd base = (1.0 + a * r.array()) * E;        // (1 + a r) exp(-a r)
 
-    void grad_params(const MatrixXd& X, const MatrixXd& A, std::vector<double>& g) const override {
-        const int n = X.rows();
-        g.assign(1 + D(), 0.0);
-        std::vector<double> invls2;
-        inv_ls_sq(invls2);
-        const double sig2v = sig2();
+        // dK / d sigma2 = base
+        Eigen::MatrixXd dK_dsigma2 = base.matrix();
+        double g_sigma2 = 0.5 * (B.cwiseProduct(dK_dsigma2)).sum(); // dL/dsigma2
+        // chain to log_sigma2
+        grad(off + static_cast<int>(D_)) += g_sigma2 * std::exp(log_sigma2_);
 
-        double g_sig2 = 0.0;
-        for (int i=0;i<n;++i) {
-            g_sig2 += 0.5 * A(i,i);
-            for (int j=i+1;j<n;++j) {
-                double s = 0.0;
-                for (size_t k=0;k<D();++k) {
-                    double d = X(i,k)-X(j,k);
-                    s += d*d*invls2[k];
-                }
-                double r = std::sqrt(std::max(0.0, s));
-                double term = (1.0 + a*r)*std::exp(-a*r);
-                double contrib = (A(i,j)+A(j,i)) * term * 0.5;
-                g_sig2 += contrib;
-            }
+        // dK / d ell_j = sigma2 * a^2 * exp(-a r) * S_j / ell_j^3
+        const double a2 = a * a;
+        for (size_t j = 0; j < D_; ++j) {
+            const double ell = std::exp(log_ell_(static_cast<int>(j)));
+            const double inv_l3 = 1.0 / (ell * ell * ell);
+            Eigen::MatrixXd dK_dell = (sigma2 * a2) * (E.matrix().cwiseProduct(Sj[j])) * inv_l3;
+            double g_ell = 0.5 * (B.cwiseProduct(dK_dell)).sum(); // dL/dell
+            grad(off + static_cast<int>(j)) += g_ell * ell;       // chain to log_ell
         }
-        g[0] = g_sig2 * sig2v;
 
-        for (size_t dim=0; dim<D(); ++dim) {
-            double li = std::exp(log_ls[dim]);
-            double invli = 1.0/li;
-            double invli3 = invli*invli*invli;
-            double accum = 0.0;
-            for (int i=0;i<n;++i) {
-                for (int j=i+1;j<n;++j) {
-                    double s = 0.0;
-                    for (size_t k=0;k<D();++k) {
-                        double d = X(i,k)-X(j,k);
-                        double invlk = 1.0/std::exp(log_ls[k]);
-                        s += d*d*invlk*invlk;
-                    }
-                    double r = std::sqrt(std::max(0.0, s));
-                    double d_dim = X(i,dim)-X(j,dim);
-                    double base = std::exp(-a*r);
-                    double dk_dli = sig2v * a*a * base * (d_dim*d_dim) * invli3;
-                    double contrib = (A(i,j)+A(j,i)) * dk_dli * 0.5;
-                    accum += contrib;
-                }
-            }
-            g[1+dim] = accum * li;
+        off += D_ + 1;
+    }
+
+    py::dict hypers_dict() const override {
+        py::dict d;
+        d["kernel"] = py::str("Matern32ARD");
+        py::array_t<double> ls(D_);
+        {
+            auto buf = ls.request();
+            double* ptr = static_cast<double*>(buf.ptr);
+            for (size_t j = 0; j < D_; ++j) ptr[j] = std::exp(log_ell_(static_cast<int>(j)));
         }
+        d["lengthscales"] = ls;
+        d["variance"] = std::exp(log_sigma2_);
+        return d;
     }
 
-    size_t num_params() const override { return 1 + D(); }
-
-    void set_params(const std::vector<double>& p) override {
-        if (p.size() != num_params()) throw std::runtime_error("Matern32ARD bad param size");
-        log_sig2 = p[0];
-        for (size_t i=0;i<D();++i) log_ls[i] = p[1+i];
-    }
-    void get_params(std::vector<double>& p) const override {
-        p.resize(num_params());
-        p[0] = log_sig2;
-        for (size_t i=0;i<D();++i) p[1+i] = log_ls[i];
-    }
+private:
+    size_t D_;
+    Eigen::VectorXd log_ell_;
+    double log_sigma2_;
 };
 
-// Linear kernel
-struct LinearKernel : public Kernel {
-    double log_sig2;
-    size_t d;
-    explicit LinearKernel(size_t d_, double init_sig2=1.0) : log_sig2(std::log(init_sig2)), d(d_) {}
+// ------------------------------- Linear Kernel -------------------------------
+// k(x,z) = sigma2 * x . z
+class LinearKernel final : public Kernel {
+public:
+    LinearKernel(size_t input_dim, double init_variance = 1.0)
+        : D_(input_dim), log_sigma2_(std::log(init_variance)) {}
 
-    inline double sig2() const { return std::exp(log_sig2); }
+    std::string name() const override { return "Linear"; }
+    size_t input_dim() const override { return D_; }
 
-    double k(const Eigen::Ref<const VectorXd>& xa,
-             const Eigen::Ref<const VectorXd>& xb) const override { return sig2() * xa.dot(xb); }
-    void K(const MatrixXd& X, MatrixXd& Kout) const override { Kout = sig2() * (X * X.transpose()); }
-    void K_cross(const MatrixXd& Xa, const MatrixXd& Xb, MatrixXd& Kout) const override {
-        Kout = sig2() * (Xa * Xb.transpose());
-    }
-
-    void grad_params(const MatrixXd& X, const MatrixXd& A, std::vector<double>& g) const override {
-        // dK/dsig2 = X X^T  -> gradient = 0.5 trace(A * dK/dsig2) * chain(log)
-        MatrixXd XXt = X * X.transpose();
-        double tr = (A.cwiseProduct(XXt)).sum();
-        g.assign(1, 0.5 * tr * sig2());
+    Eigen::MatrixXd K(const Eigen::MatrixXd& X, const Eigen::MatrixXd& Z) const override {
+        if (static_cast<size_t>(X.cols()) != D_ || static_cast<size_t>(Z.cols()) != D_) {
+            throw std::invalid_argument("LinearKernel: Input dimension mismatch.");
+        }
+        const double sigma2 = std::exp(log_sigma2_);
+        Eigen::MatrixXd K = sigma2 * (X * Z.transpose());
+        return K;
     }
 
     size_t num_params() const override { return 1; }
-    void set_params(const std::vector<double>& p) override {
-        if (p.size()!=1) throw std::runtime_error("LinearKernel bad param size");
-        log_sig2 = p[0];
+    void get_unconstrained(Eigen::VectorXd& u, size_t& off) const override { u(off++) = log_sigma2_; }
+    void set_unconstrained(const Eigen::VectorXd& u, size_t& off) override { log_sigma2_ = u(off++); }
+
+    void add_grad_wrt_unconstrained(const Eigen::MatrixXd& X,
+                                    const Eigen::MatrixXd& B,
+                                    Eigen::VectorXd& grad,
+                                    size_t& off) const override {
+        // dK/dsigma2 = X X^T
+        Eigen::MatrixXd G = X * X.transpose();
+        double g_sigma2 = 0.5 * (B.cwiseProduct(G)).sum();
+        grad(off) += g_sigma2 * std::exp(log_sigma2_); // chain to log_sigma2
+        off += 1;
     }
-    void get_params(std::vector<double>& p) const override { p = {log_sig2}; }
+
+    py::dict hypers_dict() const override {
+        py::dict d;
+        d["kernel"] = py::str("Linear");
+        d["variance"] = std::exp(log_sigma2_);
+        return d;
+    }
+
+private:
+    size_t D_;
+    double log_sigma2_;
 };
 
-// Sum kernel
-struct SumKernel : public Kernel {
-    std::unique_ptr<Kernel> k1, k2;
-    SumKernel(std::unique_ptr<Kernel> a, std::unique_ptr<Kernel> b)
-      : k1(std::move(a)), k2(std::move(b)) {}
-    double k(const Eigen::Ref<const VectorXd>& xa,
-             const Eigen::Ref<const VectorXd>& xb) const override {
-        return k1->k(xa, xb) + k2->k(xa, xb);
+// ------------------------------- Sum Kernel -------------------------------
+
+class SumKernel final : public Kernel {
+public:
+    SumKernel(std::unique_ptr<Kernel> k1, std::unique_ptr<Kernel> k2)
+        : k1_(std::move(k1)), k2_(std::move(k2)) {
+        if (k1_->input_dim() != k2_->input_dim())
+            throw std::invalid_argument("SumKernel: subkernels must have same input_dim.");
     }
-    void K(const MatrixXd& X, MatrixXd& Kout) const override {
-        MatrixXd A, B; k1->K(X, A); k2->K(X, B); Kout = A + B;
+
+    std::string name() const override { return "Sum"; }
+    size_t input_dim() const override { return k1_->input_dim(); }
+
+    Eigen::MatrixXd K(const Eigen::MatrixXd& X, const Eigen::MatrixXd& Z) const override {
+        return k1_->K(X, Z) + k2_->K(X, Z);
     }
-    void K_cross(const MatrixXd& Xa, const MatrixXd& Xb, MatrixXd& Kout) const override {
-        MatrixXd A, B; k1->K_cross(Xa, Xb, A); k2->K_cross(Xa, Xb, B); Kout = A + B;
+
+    size_t num_params() const override { return k1_->num_params() + k2_->num_params(); }
+
+    void get_unconstrained(Eigen::VectorXd& u, size_t& off) const override {
+        k1_->get_unconstrained(u, off);
+        k2_->get_unconstrained(u, off);
     }
-    void grad_params(const MatrixXd& X, const MatrixXd& A, std::vector<double>& g) const override {
-        std::vector<double> g1, g2; k1->grad_params(X, A, g1); k2->grad_params(X, A, g2);
-        g.clear(); g.reserve(g1.size()+g2.size()); g.insert(g.end(), g1.begin(), g1.end()); g.insert(g.end(), g2.begin(), g2.end());
+
+    void set_unconstrained(const Eigen::VectorXd& u, size_t& off) override {
+        k1_->set_unconstrained(u, off);
+        k2_->set_unconstrained(u, off);
     }
-    size_t num_params() const override { return k1->num_params() + k2->num_params(); }
-    void set_params(const std::vector<double>& p) override {
-        size_t n1 = k1->num_params();
-        std::vector<double> p1(p.begin(), p.begin()+n1), p2(p.begin()+n1, p.end());
-        k1->set_params(p1); k2->set_params(p2);
+
+    void add_grad_wrt_unconstrained(const Eigen::MatrixXd& X,
+                                    const Eigen::MatrixXd& B,
+                                    Eigen::VectorXd& grad,
+                                    size_t& off) const override {
+        k1_->add_grad_wrt_unconstrained(X, B, grad, off);
+        k2_->add_grad_wrt_unconstrained(X, B, grad, off);
     }
-    void get_params(std::vector<double>& p) const override {
-        std::vector<double> p1, p2; k1->get_params(p1); k2->get_params(p2);
-        p.clear(); p.reserve(p1.size()+p2.size()); p.insert(p.end(), p1.begin(), p1.end()); p.insert(p.end(), p2.begin(), p2.end());
+
+    py::dict hypers_dict() const override {
+        py::dict d;
+        d["kernel"] = py::str("Sum");
+        d["k1"] = k1_->hypers_dict();
+        d["k2"] = k2_->hypers_dict();
+        return d;
     }
+
+private:
+    std::unique_ptr<Kernel> k1_, k2_;
 };
 
-// RBF (1D) kernel
-struct RBF1D : public Kernel {
-    double log_sig2;
-    double log_l;
-    explicit RBF1D(double init_l=1.0, double init_sig2=1.0)
-      : log_sig2(std::log(init_sig2)), log_l(std::log(init_l)) {}
-    inline double sig2() const { return std::exp(log_sig2); }
-    inline double l() const { return std::exp(log_l); }
-    double k(const Eigen::Ref<const VectorXd>& xa,
-             const Eigen::Ref<const VectorXd>& xb) const override {
-        double d = xa[0] - xb[0];
-        double q = (d*d) / (l()*l());
-        return sig2() * std::exp(-0.5*q);
+// ------------------------------- RBF 1D -------------------------------
+// k(x,z) = sigma2 * exp( -0.5 * (x - z)^2 / ell^2 ) ; 1D only
+class RBF1D final : public Kernel {
+public:
+    RBF1D(double init_lengthscale = 1.0, double init_variance = 1.0)
+        : log_ell_(std::log(init_lengthscale)), log_sigma2_(std::log(init_variance)) {}
+
+    std::string name() const override { return "RBF1D"; }
+    size_t input_dim() const override { return 1; }
+
+    Eigen::MatrixXd K(const Eigen::MatrixXd& X, const Eigen::MatrixXd& Z) const override {
+        if (X.cols() != 1 || Z.cols() != 1)
+            throw std::invalid_argument("RBF1D expects inputs with shape (N,1).");
+        const double ell = std::exp(log_ell_);
+        const double sigma2 = std::exp(log_sigma2_);
+        const double inv_ell2 = 1.0 / (ell * ell);
+
+        Eigen::VectorXd x = X.col(0);
+        Eigen::VectorXd z = Z.col(0);
+        Eigen::VectorXd x2 = x.array().square().matrix();
+        Eigen::VectorXd z2 = z.array().square().matrix();
+        Eigen::MatrixXd S = x2.replicate(1, Z.rows()) + z2.transpose().replicate(X.rows(), 1) - 2.0 * (x * z.transpose());
+        Eigen::MatrixXd K = (sigma2 * (-0.5 * inv_ell2 * S.array()).exp()).matrix();
+        return K;
     }
-    void K(const MatrixXd& X, MatrixXd& Kout) const override {
-        int n = X.rows();
-        Kout.resize(n,n);
-        for (int i=0;i<n;++i) {
-            Kout(i,i) = sig2();
-            for (int j=i+1;j<n;++j) {
-                double d = X(i,0)-X(j,0);
-                double q = (d*d)/(l()*l());
-                double val = sig2()*std::exp(-0.5*q);
-                Kout(i,j)=val; Kout(j,i)=val;
-            }
-        }
-    }
-    void K_cross(const MatrixXd& Xa, const MatrixXd& Xb, MatrixXd& Kout) const override {
-        int na = Xa.rows(), nb = Xb.rows();
-        Kout.resize(na, nb);
-        for (int i=0;i<na;++i) for (int j=0;j<nb;++j) {
-            double d = Xa(i,0)-Xb(j,0);
-            double q = (d*d)/(l()*l());
-            Kout(i,j) = sig2()*std::exp(-0.5*q);
-        }
-    }
-    void grad_params(const MatrixXd& X, const MatrixXd& A, std::vector<double>& g) const override {
-        int n = X.rows();
-        double g_sig2 = 0.0, g_l = 0.0;
-        double sig2v = sig2(), lv = l();
-        double invl2 = 1.0/(lv*lv);
-        for (int i=0;i<n;++i) {
-            g_sig2 += 0.5 * A(i,i);  // add the 0.5
-            for (int j=i+1;j<n;++j) {
-                double d = X(i,0)-X(j,0);
-                double q = (d*d)*invl2;
-                double e = std::exp(-0.5*q);
-                double k = sig2v * e;
-                double contrib = (A(i,j)+A(j,i)) * e * 0.5;
-                g_sig2 += contrib;
-                // ∂k/∂l = k * ( (d^2)/(l^3) )
-                double dk_dl = k * ( (d*d) / (lv*lv*lv) );
-                double contrib_l = (A(i,j)+A(j,i)) * dk_dl * 0.5;
-                g_l += contrib_l;
-            }
-        }
-        g = { g_sig2 * sig2v, g_l * lv }; // d/d logs
-    }
+
     size_t num_params() const override { return 2; }
-    void set_params(const std::vector<double>& p) override { log_sig2 = p[0]; log_l = p[1]; }
-    void get_params(std::vector<double>& p) const override { p = {log_sig2, log_l}; }
+    void get_unconstrained(Eigen::VectorXd& u, size_t& off) const override { u(off++) = log_ell_; u(off++) = log_sigma2_; }
+    void set_unconstrained(const Eigen::VectorXd& u, size_t& off) override { log_ell_ = u(off++); log_sigma2_ = u(off++); }
+
+    void add_grad_wrt_unconstrained(const Eigen::MatrixXd& X,
+                                    const Eigen::MatrixXd& B,
+                                    Eigen::VectorXd& grad,
+                                    size_t& off) const override {
+        if (X.cols() != 1) throw std::invalid_argument("RBF1D expects inputs with shape (N,1).");
+        const int N = static_cast<int>(X.rows());
+        const double ell = std::exp(log_ell_);
+        const double sigma2 = std::exp(log_sigma2_);
+        const double inv_ell2 = 1.0 / (ell * ell);
+
+        Eigen::VectorXd x = X.col(0);
+        Eigen::VectorXd x2 = x.array().square().matrix();
+        Eigen::MatrixXd S = x2.replicate(1, N) + x2.transpose().replicate(N, 1) - 2.0 * (x * x.transpose());
+        Eigen::MatrixXd base = (-0.5 * inv_ell2 * S.array()).exp().matrix(); // exp(-0.5 S/ell^2)
+
+        // dK/dsigma2 = base
+        Eigen::MatrixXd dK_dsigma2 = base;
+        double g_sigma2 = 0.5 * (B.cwiseProduct(dK_dsigma2)).sum();
+        grad(off + 1) += g_sigma2 * sigma2; // chain to log_sigma2
+
+        // dK/dell = sigma2 * base * (S / ell^3)
+        double inv_ell3 = 1.0 / (ell * ell * ell);
+        Eigen::MatrixXd dK_dell = sigma2 * base.cwiseProduct(S) * inv_ell3;
+        double g_ell = 0.5 * (B.cwiseProduct(dK_dell)).sum();
+        grad(off + 0) += g_ell * ell;       // chain to log_ell
+
+        off += 2;
+    }
+
+    py::dict hypers_dict() const override {
+        py::dict d;
+        d["kernel"] = py::str("RBF1D");
+        d["lengthscale"] = std::exp(log_ell_);
+        d["variance"] = std::exp(log_sigma2_);
+        return d;
+    }
+
+private:
+    double log_ell_;
+    double log_sigma2_;
 };
+
+// ------------------------------- GP Regression -------------------------------
 
 class GPRegression {
 public:
-    std::unique_ptr<Kernel> kernel;
-    double log_noise;     // noise variance in log space
-    double jitter;        // numeric jitter added to K
-    MatrixXd X;
-    VectorXd y;
-
-    // Cached after fit:
-    MatrixXd K;       // n x n
-    Eigen::LLT<MatrixXd> chol; // Cholesky of K
-    VectorXd alpha;   // K^{-1} y
-
-    GPRegression(std::unique_ptr<Kernel> k, double noise_var=1e-2, double jitter_=1e-4)
-      : kernel(std::move(k)), log_noise(std::log(noise_var)), jitter(jitter_) {}
-
-    void set_data(py::array_t<double, py::array::c_style | py::array::forcecast> Xnp,
-                  py::array_t<double, py::array::c_style | py::array::forcecast> ynp) {
-        auto Xbuf = Xnp.request(), ybuf = ynp.request();
-        const int n = Xbuf.shape[0];
-        const int d = Xbuf.shape.size() == 1 ? 1 : Xbuf.shape[1];
-        if (ybuf.shape[0] != n) throw std::runtime_error("X,y size mismatch");
-        X = MatrixXd(n, d);
-        y = VectorXd(n);
-        // copy
-        const double* Xp = static_cast<const double*>(Xbuf.ptr);
-        for (int i=0;i<n;++i) for (int j=0;j<d;++j) X(i,j) = Xp[i*d + j];
-        const double* yp = static_cast<const double*>(ybuf.ptr);
-        for (int i=0;i<n;++i) y[i] = yp[i];
+    GPRegression(std::unique_ptr<Kernel> kernel, double noise_var = 1e-2, double jitter = 1e-4)
+        : kernel_(std::move(kernel)), log_noise_(std::log(noise_var)), jitter_(jitter)
+    {
+        if (!kernel_) throw std::invalid_argument("Kernel must not be null.");
     }
 
-    double nlml_and_grad(std::vector<double>& g) {
-        const int n = X.rows();
-        // Build K
-        kernel->K(X, K);
-        K.diagonal().array() += std::exp(log_noise) + jitter;
-        chol.compute(K);
-        if (chol.info()!=Eigen::Success) {
-            // Add more jitter if needed
-            double add = jitter;
-            for (int tries=0; tries<6 && chol.info()!=Eigen::Success; ++tries) {
-                add *= 10.0;
-                K = K + add * MatrixXd::Identity(n,n);
-                chol.compute(K);
+    void set_data(py::array_t<double> X_in, py::array_t<double> y_in) {
+        X_ = as_eigen_2d(X_in);
+        y_ = as_eigen_vec(y_in);
+        const auto N = X_.rows();
+        if (y_.rows() != N)
+            throw std::invalid_argument("set_data: X and y have incompatible first dimension.");
+        // invalidate cache
+        L_.resize(0,0);
+    }
+
+    // Adam on MAP objective: NLML + (-log prior(noise))
+    void fit(int num_steps = 1000, double lr = 1e-4) {
+        if (X_.size() == 0) throw std::runtime_error("No data set. Call set_data first.");
+        const int N = static_cast<int>(X_.rows());
+
+        // flatten params: [kernel params (unconstrained), log_noise]
+        const size_t Pk = kernel_->num_params();
+        const size_t P = Pk + 1;
+        Eigen::VectorXd u(P);
+        {
+            size_t off = 0;
+            kernel_->get_unconstrained(u, off);
+            u(off++) = log_noise_;
+        }
+
+        // Adam state
+        const double beta1 = 0.9, beta2 = 0.999, eps = 1e-8;
+        Eigen::VectorXd m = Eigen::VectorXd::Zero(P);
+        Eigen::VectorXd v = Eigen::VectorXd::Zero(P);
+
+        // constants for LogNormal prior on noise (PyroSample in your code)
+        const double mu = std::log(1e-2);
+        const double sigma = 0.5;
+        const double sigma2 = sigma * sigma;
+        const double halfNlog2pi = 0.5 * N * std::log(2.0 * M_PI);
+
+        for (int t = 1; t <= num_steps; ++t) {
+            // unpack
+            size_t off = 0;
+            kernel_->set_unconstrained(u, off);
+            log_noise_ = u(off++);
+            const double noise = std::exp(log_noise_);
+
+            // K = K(X,X) + (noise + jitter) I
+            Eigen::MatrixXd K = kernel_->K(X_);
+            K.diagonal().array() += (noise + jitter_);
+
+            // Cholesky
+            Eigen::LLT<Eigen::MatrixXd> llt(K);
+            if (llt.info() != Eigen::Success) {
+                throw std::runtime_error("Cholesky factorization failed. Try larger jitter.");
             }
-            if (chol.info()!=Eigen::Success) throw std::runtime_error("Cholesky failed");
+            Eigen::MatrixXd L = llt.matrixL();
+
+            // alpha = K^{-1} y via solves
+            Eigen::VectorXd alpha = llt.solve(y_);
+
+            // logdet K = 2 * sum(log diag(L))
+            double logdet = 0.0;
+            for (int i = 0; i < L.rows(); ++i) logdet += std::log(L(i,i));
+            logdet *= 2.0;
+
+            // NLML
+            double nll = 0.5 * y_.dot(alpha) + 0.5 * logdet + halfNlog2pi;
+
+            // Negative log prior for noise ~ LogNormal(mu, sigma)
+            // nlp = log(noise) + log(sigma*sqrt(2pi)) + (log(noise)-mu)^2/(2*sigma^2)
+            const double logn = log_noise_;
+            double nlp_noise = logn + std::log(sigma * std::sqrt(2.0*M_PI)) + (logn - mu)*(logn - mu) / (2.0 * sigma2);
+
+            double loss = nll + nlp_noise;
+
+            // -------- gradient ----------
+            // B = alpha alpha^T - K^{-1}
+            Eigen::MatrixXd Kinv = llt.solve(Eigen::MatrixXd::Identity(N, N));
+            Eigen::MatrixXd B = alpha * alpha.transpose() - Kinv;
+
+            Eigen::VectorXd g = Eigen::VectorXd::Zero(P);
+            // kernel hypers grad (w.r.t log params)
+            off = 0;
+            kernel_->add_grad_wrt_unconstrained(X_, B, g, off);
+
+            // noise grad (marginal likelihood term): 0.5 * tr(B * dK/dnoise) * dnoise/dlognoise
+            // dK/dnoise = I
+            double dL_dnoise = 0.5 * B.trace();
+            g(off) += dL_dnoise * noise;
+
+            // add prior grad wrt log noise: d/d(log n) [log n + (log n - mu)^2/(2 sigma^2)] = 1 + (logn - mu)/sigma^2
+            g(off) += 1.0 + (logn - mu) / sigma2;
+            // (constant term log(sigma sqrt(2pi)) drops)
+
+            // Adam update
+            m = beta1 * m + (1.0 - beta1) * g;
+            v = beta2 * v + (1.0 - beta2) * g.array().square().matrix();
+
+            Eigen::VectorXd mhat = m / (1.0 - std::pow(beta1, t));
+            Eigen::VectorXd vhat = v / (1.0 - std::pow(beta2, t));
+
+            Eigen::ArrayXd step = lr * mhat.array() / (vhat.array().sqrt() + eps);
+            u -= step.matrix();
+            
+            // (optional) could store last L for warm-start predict; we recompute in predict anyway.
         }
+
+        // write back final params
+        size_t off2 = 0;
+        kernel_->set_unconstrained(u, off2);
+        log_noise_ = u(off2++);
+
+        // cache last K chol for predict-only scenario? (not strictly necessary)
+        L_.resize(0,0);
+    }
+
+    // predict: returns (mean, var) at Xq, marginal (diagonal) only, noiseless or noisy.
+    std::pair<py::array_t<double>, py::array_t<double>>
+    predict(py::array_t<double> Xq_in, bool noiseless = true) const {
+        if (X_.size() == 0) throw std::runtime_error("No data set. Call set_data first.");
+
+        Eigen::MatrixXd Xq = as_eigen_2d(Xq_in);
+        if (Xq.cols() != X_.cols())
+            throw std::invalid_argument("predict: Xq has wrong feature dimension.");
+
+        const double noise = std::exp(log_noise_);
+        // Build training K and chol
+        Eigen::MatrixXd K = kernel_->K(X_);
+        K.diagonal().array() += (noise + jitter_);
+        Eigen::LLT<Eigen::MatrixXd> llt(K);
+        if (llt.info() != Eigen::Success)
+            throw std::runtime_error("Cholesky factorization failed in predict().");
+
+        Eigen::MatrixXd L = llt.matrixL();
+
         // alpha = K^{-1} y
-        alpha = chol.solve(y);
-        // NLML = 0.5 y^T alpha + sum(log(diag(L))) + 0.5 n log(2π)
-        double term1 = 0.5 * y.dot(alpha);
-        double logdet = 0.0;
-        for (int i=0;i<n;++i) logdet += std::log(chol.matrixL()(i,i));
-        double nlml = term1 + logdet + 0.5 * n * std::log(2.0*M_PI);
+        Eigen::VectorXd alpha = llt.solve(y_);
 
-        // A = alpha alpha^T - K^{-1}
-        MatrixXd Linv = chol.matrixL().solve(MatrixXd::Identity(n,n)); // L^{-1}
-        MatrixXd Kinv = Linv.transpose() * Linv;
-        MatrixXd A = alpha*alpha.transpose() - Kinv;
+        // cross-cov and self-cov
+        Eigen::MatrixXd KfXq = kernel_->K(X_, Xq);        // N x M
+        Eigen::MatrixXd Kqq  = kernel_->K(Xq, Xq);        // M x M
 
-        // Grad w.r.t. kernel params
-        std::vector<double> gk;
-        kernel->grad_params(X, A, gk);
+        // mean = KfXq^T * alpha
+        Eigen::VectorXd mean = (KfXq.transpose() * alpha);
 
-        // Grad w.r.t. noise (variance): dK/dσ_n^2 = I
-        double g_noise = 0.5 * (A.cwiseProduct(MatrixXd::Identity(n,n))).sum();
-        // d/d log_noise = d/d σ_n^2 * σ_n^2
-        g_noise *= std::exp(log_noise);
+        // v = solve(L, KfXq)
+        Eigen::MatrixXd v = L.triangularView<Eigen::Lower>().solve(KfXq);
+        // var_diag = diag(Kqq - v^T v)
+        Eigen::VectorXd var = Kqq.diagonal() - (v.array().square().colwise().sum()).matrix().transpose();
 
-        // Assemble gradient vector: [kernel params..., log_noise]
-        g = gk;
-        g.push_back(g_noise);
+        if (!noiseless) var.array() += noise;
 
-        return nlml;
+        return {eigen_to_numpy(mean), eigen_to_numpy(var)};
     }
 
-    void fit(int num_steps, double lr) {
-        // Pack parameters into a flat vector
-        std::vector<double> params;
-        kernel->get_params(params);
-        params.push_back(log_noise); // last entry
+    // sample from marginal normals N(mean_i, var_i)
+    py::array_t<double> sample_marginals(py::array_t<double> Xq_in, bool noiseless = true, int seed = 0) const {
+        auto mv = predict(Xq_in, noiseless);
+        Eigen::VectorXd mean = as_eigen_vec(mv.first);
+        Eigen::VectorXd var  = as_eigen_vec(mv.second);
 
-        Adam opt(params.size(), lr);
-        for (int t=0; t<num_steps; ++t) {
-            // Unpack
-            std::vector<double> kp(params.begin(), params.end()-1);
-            double ln = params.back();
-            kernel->set_params(kp);
-            log_noise = ln;
+        std::mt19937_64 rng(static_cast<uint64_t>(seed));
+        std::normal_distribution<double> N01(0.0, 1.0);
 
-            // Forward + grad
-            std::vector<double> g;
-            double loss = nlml_and_grad(g);
-
-            // Adam step
-            opt.step(params, g);
+        Eigen::VectorXd s(mean.size());
+        for (int i = 0; i < mean.size(); ++i) {
+            double stdv = std::sqrt(std::max(0.0, var(i)));
+            s(i) = mean(i) + stdv * N01(rng);
         }
-        // Finalize
-        std::vector<double> kp(params.begin(), params.end()-1);
-        kernel->set_params(kp);
-        log_noise = params.back();
-        // Cache final K, chol, alpha
-        std::vector<double> g;
-        nlml_and_grad(g);
-    }
-
-    // Predict: returns mean and variance (diagonal), noiseless flag removes noise from variance
-    std::pair<py::array_t<double>, py::array_t<double>> predict(
-        py::array_t<double, py::array::c_style | py::array::forcecast> Xq_np,
-        bool noiseless=true) {
-
-        auto Qbuf = Xq_np.request();
-        int nq = Qbuf.shape[0];
-        int d = Qbuf.shape.size() == 1 ? 1 : Qbuf.shape[1];
-        MatrixXd Xq(nq, d);
-        const double* Xp = static_cast<const double*>(Qbuf.ptr);
-        for (int i=0;i<nq;++i) for (int j=0;j<d;++j) Xq(i,j) = Xp[i*d + j];
-
-        MatrixXd Kxs, Kss;
-        kernel->K_cross(Xq, X, Kxs);   // nq x n
-        kernel->K(Xq, Kss);            // nq x nq (only diag used)
-
-        // mean = Kxs K^{-1} y = Kxs alpha
-        VectorXd mean = Kxs * alpha;
-
-        // v = solve(L, Kxs^T)  -> n x nq
-        MatrixXd v = chol.matrixL().solve(Kxs.transpose());
-        // var = diag(Kss) - sum(v^2, axis=0)
-        VectorXd var(nq);
-        for (int i=0;i<nq;++i) {
-            double diagK = Kss(i,i);
-            double sumv2 = v.col(i).squaredNorm();
-            double base = std::max(1e-15, diagK - sumv2);
-            if (!noiseless) base += std::exp(log_noise);
-            var[i] = base;
-        }
-
-        // Return NumPy arrays
-        py::array_t<double> mean_np(nq), var_np(nq);
-        auto m = mean_np.mutable_unchecked<1>();
-        auto s = var_np.mutable_unchecked<1>();
-        for (int i=0;i<nq;++i) { m(i) = mean[i]; s(i) = var[i]; }
-        return {mean_np, var_np};
-    }
-
-    // Simple marginal sampler: f(x) ~ N(mu(x), var(x)) i.i.d. across x (ok for our use)
-    py::array_t<double> sample_marginals(
-        py::array_t<double, py::array::c_style | py::array::forcecast> Xq_np,
-        bool noiseless=true, uint64_t seed=0) {
-
-        auto pr = predict(Xq_np, noiseless);
-        py::array_t<double> mean_np = pr.first;
-        py::array_t<double> var_np  = pr.second;
-        auto m = mean_np.unchecked<1>();
-        auto v = var_np.unchecked<1>();
-
-        std::mt19937_64 rng(seed ? seed : std::random_device{}());
-        std::normal_distribution<double> N(0.0, 1.0);
-        const ssize_t n = m.shape(0);
-        py::array_t<double> out(n);
-        auto o = out.mutable_unchecked<1>();
-        for (ssize_t i=0;i<n;++i) {
-            double z = N(rng);
-            o(i) = m(i) + std::sqrt(std::max(0.0, v(i))) * z;
-        }
-        return out;
+        return eigen_to_numpy(s);
     }
 
     py::dict get_hypers() const {
-        std::vector<double> kp; kernel->get_params(kp);
         py::dict d;
-        d["kernel_params"] = kp;
-        d["log_noise"] = log_noise;
+        d["noise"]  = std::exp(log_noise_);
+        d["jitter"] = jitter_;
+        d["kernel"] = kernel_->hypers_dict();
         return d;
     }
+
+private:
+    std::unique_ptr<Kernel> kernel_;
+    Eigen::MatrixXd X_;
+    Eigen::VectorXd y_;
+    mutable Eigen::MatrixXd L_; // not used now (placeholder for caching)
+    double log_noise_;
+    double jitter_;
 };
+
+// ------------------------------- PYBIND11 module -------------------------------
 
 PYBIND11_MODULE(fastcarbs_core, m) {
     py::class_<GPRegression, py::smart_holder>(m, "GPRegression")
-        .def(py::init<std::unique_ptr<Kernel>, double, double>(),
+        .def(py::init<std::unique_ptr<Kernel>, float, float>(),
              py::arg("kernel"), py::arg("noise_var")=1e-2, py::arg("jitter")=1e-4)
         .def("set_data", &GPRegression::set_data)
         .def("fit", &GPRegression::fit, py::arg("num_steps")=1000, py::arg("lr")=1e-4)
@@ -506,12 +587,12 @@ PYBIND11_MODULE(fastcarbs_core, m) {
     py::class_<Kernel, py::smart_holder>(m, "Kernel");
 
     py::class_<Matern32ARD, Kernel, py::smart_holder>(m, "Matern32ARD")
-        .def(py::init<size_t,double,double>(),
+        .def(py::init<size_t,float,float>(),
              py::arg("input_dim"), py::arg("init_lengthscale"),
              py::arg("init_variance")=1.0);
 
     py::class_<LinearKernel, Kernel, py::smart_holder>(m, "LinearKernel")
-        .def(py::init<size_t,double>(),
+        .def(py::init<size_t,float>(),
              py::arg("input_dim"), py::arg("init_variance")=1.0);
 
     py::class_<SumKernel, Kernel, py::smart_holder>(m, "SumKernel")
@@ -519,6 +600,6 @@ PYBIND11_MODULE(fastcarbs_core, m) {
              py::arg("k1"), py::arg("k2"));
 
     py::class_<RBF1D, Kernel, py::smart_holder>(m, "RBF1D")
-        .def(py::init<double,double>(),
+        .def(py::init<float,float>(),
              py::arg("init_lengthscale")=1.0, py::arg("init_variance")=1.0);
 }
