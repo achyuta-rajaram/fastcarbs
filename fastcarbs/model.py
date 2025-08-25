@@ -8,7 +8,6 @@ from sklearn.preprocessing import MinMaxScaler, QuantileTransformer
 from torch import Tensor
 from torch.distributions import Normal
 
-# Reuse your exact datatypes/enums so it's a drop-in
 from carbs.utils import (
     ObservationInBasic,
     OutstandingSuggestionEstimatorEnum,
@@ -74,14 +73,14 @@ class SurrogateModel:
         self.max_logcost: float = float("inf")
         self.min_pareto_logcost: float = float("-inf")
         self.max_pareto_logcost: float = float("inf")
-        # caches for refits
         self._X_obs: Optional[TorchTensor] = None
         self._y_obs: Optional[TorchTensor] = None
 
     def _make_main_kernel(self) -> core.Kernel:
         d = int(self.params.real_dims)
         return core.SumKernel(
-            core.Matern32ARD(d, self.params.scale_length, 1.0), core.LinearKernel(d, 1.0)
+            core.Matern32ARD(d, self.params.scale_length, 1.0),
+            core.LinearKernel(d, 1.0),
         )
 
     def _make_pareto_kernel(self) -> core.Kernel:
@@ -92,7 +91,7 @@ class SurrogateModel:
             kernel = self._make_main_kernel()
         gp = _CppGP(kernel, noise_var=1e-2, jitter=1e-4)
         gp.set_data(X.double(), y.double())
-        gp.fit()
+        gp.fit(num_steps=1000, lr=1e-4)
         return gp
 
     def _fit_target_transformers(self, success_observations: List[ObservationInBasic]) -> None:
@@ -102,6 +101,7 @@ class SurrogateModel:
             output_distribution="normal", n_quantiles=n_quantiles
         )
         self.output_transformer.fit(raw_outputs.reshape(-1, 1))
+
         log_costs = np.log(np.array([x.cost for x in success_observations], dtype=np.float64))
         self.cost_transformer = MinMaxScaler(feature_range=(-1, 1))
         self.cost_transformer.fit(log_costs.reshape(-1, 1))
@@ -136,9 +136,9 @@ class SurrogateModel:
         )
         return torch.from_numpy(np.exp(inv)).to(torch.float64).view(*x.shape)
 
-    # ---- public API used by CARBS ----
     def fit_observations(self, success_observations: List[ObservationInBasic]) -> None:
         self._fit_target_transformers(success_observations)
+
         X = (
             torch.stack([x.real_number_input for x in success_observations])
             .detach()
@@ -148,6 +148,7 @@ class SurrogateModel:
             torch.tensor([x.output for x in success_observations], dtype=torch.float64)
         )
         self._X_obs, self._y_obs = X.clone(), y.clone()
+
         self.output_model = self._get_model(X, y)
         logc = self._cost_to_logcost(
             torch.tensor([x.cost for x in success_observations], dtype=torch.float64)
@@ -158,27 +159,19 @@ class SurrogateModel:
         if len(outstanding_suggestions) == 0:
             return
         assert self.output_model is not None and self._X_obs is not None and self._y_obs is not None
+
         X_new = (
             torch.stack([x.real_number_input for x in outstanding_suggestions])
             .detach()
             .to(torch.float64)
         )
-        if (
-            self.params.outstanding_suggestion_estimator
-            == OutstandingSuggestionEstimatorEnum.MEAN
-        ):
-            mu, _ = self.output_model.predict(X_new, noiseless=True)
-            y_new = mu
-        elif (
-            self.params.outstanding_suggestion_estimator
-            == OutstandingSuggestionEstimatorEnum.THOMPSON
-        ):
-            y_new = self.output_model.sample_marginals(X_new, noiseless=True)
-        else:
-            raise RuntimeError("Unsupported outstanding suggestion estimator")
+
+        mu, _ = self.output_model.predict(X_new, noiseless=True)
+        y_new = mu
+
         X_aug = torch.cat([self._X_obs, X_new], dim=0)
         y_aug = torch.cat([self._y_obs, y_new], dim=0)
-        # Refit a fresh model to augmented data
+
         self.output_model = self._get_model(X_aug, y_aug)
 
     def fit_pareto_set(self, pareto_observations: List[ObservationInBasic]) -> None:
@@ -192,7 +185,7 @@ class SurrogateModel:
         )
         gp = _CppGP(self._make_pareto_kernel(), noise_var=1e-2, jitter=1e-4)
         gp.set_data(logc, outs)
-        gp.fit(num_steps=1000, lr=1e-2)  # 1D => fewer steps suffice
+        gp.fit(num_steps=1000, lr=1e-2)
         self.pareto_model = gp
         self.min_pareto_logcost = float(logc.min().item())
         self.max_pareto_logcost = float(logc.max().item())
@@ -235,8 +228,10 @@ class SurrogateModel:
     def observe_surrogate(self, samples_in_basic: TorchTensor) -> SurrogateObservationOutputs:
         assert self.output_model is not None and self.cost_model is not None
         Xq = samples_in_basic.to(torch.float64)
+
         mu_surr, var_surr = self.output_model.predict(Xq, noiseless=True)
         mu_logc, var_logc = self.cost_model.predict(Xq, noiseless=True)
+
         if self.pareto_model is not None:
             lc = torch.clamp(
                 mu_logc, min=self.min_pareto_logcost, max=self.max_pareto_logcost
@@ -250,7 +245,7 @@ class SurrogateModel:
         success_p = self._get_success_prob(Xq)
         cost_est = self._logcost_to_cost(mu_logc)
         target_est = self._surrogate_to_target(mu_surr)
-        # target variance (for logging): approximate via +/- 1 std mapping through inverse
+
         std_s = torch.sqrt(torch.clamp(var_surr, min=1e-12))
         tgt_hi = self._surrogate_to_target(mu_surr + std_s)
         tgt_lo = self._surrogate_to_target(mu_surr - std_s)
@@ -266,5 +261,3 @@ class SurrogateModel:
             target_var=tgt_var,
             success_probability=success_p,
         )
-
-
