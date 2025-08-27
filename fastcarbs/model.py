@@ -37,8 +37,8 @@ class _CppGP:
         self._fitted = False
 
     def set_data(self, X: TorchTensor, y: TorchTensor) -> None:
-        self._X_cache = X.detach().cpu().double().clone()
-        self._y_cache = y.detach().cpu().double().clone()
+        self._X_cache = X.detach().cpu().float().clone()
+        self._y_cache = y.detach().cpu().float().clone()
         self._gp.set_data(self._X_cache.numpy(), self._y_cache.numpy())
 
     def fit(self, num_steps: int = 1000, lr: float = 1e-4) -> None:
@@ -46,13 +46,13 @@ class _CppGP:
         self._fitted = True
 
     def predict(self, Xq: TorchTensor, noiseless: bool = True):
-        mean_np, var_np = self._gp.predict(Xq.detach().cpu().double().numpy(), noiseless)
+        mean_np, var_np = self._gp.predict(Xq.detach().cpu().float().numpy(), noiseless)
         mean = torch.from_numpy(np.asarray(mean_np)).to(torch.float64)
         var = torch.from_numpy(np.asarray(var_np)).to(torch.float64)
         return mean, var
 
     def sample_marginals(self, Xq: TorchTensor, noiseless: bool = True, seed: int = 0) -> TorchTensor:
-        s = self._gp.sample_marginals(Xq.detach().cpu().double().numpy(), noiseless, int(seed))
+        s = self._gp.sample_marginals(Xq.detach().cpu().float().numpy(), noiseless, int(seed))
         return torch.from_numpy(np.asarray(s)).to(torch.float64)
 
     @property
@@ -90,7 +90,7 @@ class SurrogateModel:
         if kernel is None:
             kernel = self._make_main_kernel()
         gp = _CppGP(kernel, noise_var=1e-2, jitter=1e-4)
-        gp.set_data(X.double(), y.double())
+        gp.set_data(X.float(), y.float())
         gp.fit(num_steps=1000, lr=1e-4)
         return gp
 
@@ -111,13 +111,13 @@ class SurrogateModel:
 
     def _target_to_surrogate(self, x: TorchTensor) -> TorchTensor:
         assert self.output_transformer is not None
-        x_np = x.cpu().double().view(-1, 1).numpy()
+        x_np = x.cpu().float().view(-1, 1).numpy()
         tx = self.output_transformer.transform(x_np) * self.params.better_direction_sign
         return torch.from_numpy(tx).to(torch.float64).view(*x.shape)
 
     def _surrogate_to_target(self, x: TorchTensor) -> TorchTensor:
         assert self.output_transformer is not None
-        x_np = x.detach().cpu().double().view(-1, 1).numpy()
+        x_np = x.detach().cpu().float().view(-1, 1).numpy()
         inv = self.output_transformer.inverse_transform(
             x_np * self.params.better_direction_sign
         )
@@ -125,14 +125,14 @@ class SurrogateModel:
 
     def _cost_to_logcost(self, x: TorchTensor) -> TorchTensor:
         assert self.cost_transformer is not None
-        x_np = torch.log(x.detach().cpu().double().view(-1, 1)).numpy()
+        x_np = torch.log(x.detach().cpu().float().view(-1, 1)).numpy()
         tx = self.cost_transformer.transform(x_np)
         return torch.from_numpy(tx).to(torch.float64).view(*x.shape)
 
     def _logcost_to_cost(self, x: TorchTensor) -> TorchTensor:
         assert self.cost_transformer is not None
         inv = self.cost_transformer.inverse_transform(
-            x.detach().cpu().double().view(-1, 1).numpy()
+            x.detach().cpu().float().view(-1, 1).numpy()
         )
         return torch.from_numpy(np.exp(inv)).to(torch.float64).view(*x.shape)
 
