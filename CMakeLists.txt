@@ -26,4 +26,4 @@ if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   list(APPEND _fast_local_flags -mno-daz-ftz)
 endif()
 
-target_compile_options(fastcarbs_core PRIVATE -O3 -ffast-math -march=native -fdenormal-fp-math=ieee)
+target_compile_options(fastcarbs_core PRIVATE -O3 -ffast-math -march=native -fno-unsafe-math-optimizations)
