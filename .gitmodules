@@ -1,3 +1,4 @@
 [submodule "carbs-base"]
 	path = carbs-base
 	url = https://github.com/achyuta-rajaram/carbs
+	branch = main
